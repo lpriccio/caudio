@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
+from elevenlabs import ElevenLabs
 from mcp.server.fastmcp import FastMCP
 from openai import OpenAI
 
@@ -15,16 +16,18 @@ from openai import OpenAI
 load_dotenv(Path(__file__).parent.parent.parent / ".env")
 
 # =============================================================================
-# CONFIGURATION
+# CONFIGURATION - Change TTS_BACKEND to switch between providers
 # =============================================================================
-# TTS backend: "openai" or "elevenlabs" (when added)
-TTS_BACKEND = "openai"
+# TTS backend: "openai" or "elevenlabs"
+TTS_BACKEND = "elevenlabs"
 
-# OpenAI TTS model: "tts-1" (fast) or "tts-1-hd" (higher quality)
-OPENAI_TTS_MODEL = "tts-1"
+# OpenAI config
+OPENAI_TTS_MODEL = "tts-1"      # "tts-1" (fast) or "tts-1-hd" (quality)
+OPENAI_TTS_VOICE = "nova"       # alloy, echo, fable, onyx, nova, shimmer
 
-# OpenAI voices: alloy, echo, fable, onyx, nova, shimmer
-OPENAI_TTS_VOICE = "nova"
+# ElevenLabs config
+ELEVENLABS_MODEL = "eleven_multilingual_v2"  # or "eleven_turbo_v2_5" (faster)
+ELEVENLABS_VOICE = "Rachel"     # See list_voices() for options
 # =============================================================================
 
 # Setup logging to stderr (not stdout - important for MCP stdio transport)
@@ -37,6 +40,19 @@ logger = logging.getLogger(__name__)
 
 # Initialize the MCP server
 mcp = FastMCP("caudio")
+
+# ElevenLabs voice name -> ID mapping (popular voices)
+ELEVENLABS_VOICES = {
+    "Rachel": "21m00Tcm4TlvDq8ikWAM",      # Warm, clear, American female
+    "Domi": "AZnzlk1XvdvUeBnXmlld",        # Strong, confident female
+    "Bella": "EXAVITQu4vr4xnSDxMaL",       # Soft, gentle female
+    "Antoni": "ErXwobaYiN019PkySvjV",      # Well-rounded male
+    "Elli": "MF3mGyEYCl7XYWbV9V6O",        # Young, friendly female
+    "Josh": "TxGEqnHWrfWFTfGW9XjX",        # Deep, narrative male
+    "Arnold": "VR6AewLTigWG4xSOukaG",      # Crisp, announcer male
+    "Adam": "pNInz6obpgDQGcFmaJgB",        # Deep, narrative male
+    "Sam": "yoZ06aMxZJJ28mfd3POQ",         # Raspy, dynamic male
+}
 
 
 def text_to_slug(text: str, max_length: int = 40) -> str:
@@ -59,6 +75,43 @@ def get_openai_client() -> OpenAI:
     return OpenAI(api_key=api_key)
 
 
+def get_elevenlabs_client() -> ElevenLabs:
+    """Get an ElevenLabs client, checking for API key."""
+    api_key = os.getenv("ELEVENLABS_API_KEY")
+    if not api_key:
+        raise ValueError("ELEVENLABS_API_KEY not set in environment")
+    return ElevenLabs(api_key=api_key)
+
+
+def speak_openai(text: str, voice: str, model: str) -> bytes:
+    """Generate speech using OpenAI TTS."""
+    client = get_openai_client()
+    response = client.audio.speech.create(
+        model=model,
+        voice=voice,
+        input=text,
+    )
+    return response.content
+
+
+def speak_elevenlabs(text: str, voice: str, model: str) -> bytes:
+    """Generate speech using ElevenLabs."""
+    client = get_elevenlabs_client()
+
+    # Resolve voice name to ID
+    voice_id = ELEVENLABS_VOICES.get(voice, voice)
+
+    response = client.text_to_speech.convert(
+        voice_id=voice_id,
+        text=text,
+        model_id=model,
+    )
+
+    # Response is a generator, collect all chunks
+    audio_bytes = b"".join(response)
+    return audio_bytes
+
+
 @mcp.tool()
 def speak(
     text: str,
@@ -72,26 +125,27 @@ def speak(
     Args:
         text: The text to convert to speech.
         output_dir: Directory to save the audio. Use "{cwd}/audio" where cwd is Claude's working directory.
-        voice: Voice to use. OpenAI options: alloy, echo, fable, onyx, nova, shimmer.
-               Leave empty to use default (nova).
-        model: TTS model. OpenAI options: "tts-1" (fast) or "tts-1-hd" (quality).
-               Leave empty to use default (tts-1).
+        voice: Voice to use. Leave empty for default.
+               OpenAI: alloy, echo, fable, onyx, nova, shimmer
+               ElevenLabs: Rachel, Domi, Bella, Antoni, Elli, Josh, Arnold, Adam, Sam
+        model: TTS model. Leave empty for default.
+               OpenAI: "tts-1" or "tts-1-hd"
+               ElevenLabs: "eleven_multilingual_v2" or "eleven_turbo_v2_5"
 
     Returns:
         Path to the saved audio file.
     """
-    voice = voice or OPENAI_TTS_VOICE
-    model = model or OPENAI_TTS_MODEL
+    # Set defaults based on backend
+    if TTS_BACKEND == "elevenlabs":
+        voice = voice or ELEVENLABS_VOICE
+        model = model or ELEVENLABS_MODEL
+        audio_bytes = speak_elevenlabs(text, voice, model)
+    else:
+        voice = voice or OPENAI_TTS_VOICE
+        model = model or OPENAI_TTS_MODEL
+        audio_bytes = speak_openai(text, voice, model)
 
-    logger.info(f"Generating speech with {TTS_BACKEND} ({model}, {voice}): {text[:50]}...")
-
-    client = get_openai_client()
-
-    response = client.audio.speech.create(
-        model=model,
-        voice=voice,
-        input=text,
-    )
+    logger.info(f"Generated speech with {TTS_BACKEND} ({model}, {voice}): {text[:50]}...")
 
     # Create output directory if needed
     output_path = Path(output_dir)
@@ -104,7 +158,8 @@ def speak(
     filepath = output_path / filename
 
     # Save audio
-    response.stream_to_file(filepath)
+    with open(filepath, "wb") as f:
+        f.write(audio_bytes)
 
     logger.info(f"Audio saved to: {filepath}")
     return f"Audio saved to: {filepath}"
@@ -167,6 +222,28 @@ def list_voices() -> str:
             marker = " (default)" if name == OPENAI_TTS_VOICE else ""
             result += f"  - {name}: {desc}{marker}\n"
         return result
+
+    elif TTS_BACKEND == "elevenlabs":
+        voices = [
+            ("Rachel", "Warm, clear, American female"),
+            ("Domi", "Strong, confident female"),
+            ("Bella", "Soft, gentle female"),
+            ("Antoni", "Well-rounded male"),
+            ("Elli", "Young, friendly female"),
+            ("Josh", "Deep, narrative male"),
+            ("Arnold", "Crisp, announcer male"),
+            ("Adam", "Deep, narrative male"),
+            ("Sam", "Raspy, dynamic male"),
+        ]
+        result = "ElevenLabs Voices:\n"
+        for name, desc in voices:
+            marker = " (default)" if name == ELEVENLABS_VOICE else ""
+            result += f"  - {name}: {desc}{marker}\n"
+        result += "\nModels:\n"
+        result += "  - eleven_multilingual_v2: Best quality, 29 languages\n"
+        result += "  - eleven_turbo_v2_5: Faster, English-optimized\n"
+        return result
+
     else:
         return f"Unknown backend: {TTS_BACKEND}"
 
